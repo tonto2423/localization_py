@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 import math
 from typing import Optional
+from collections import deque
 
 import rclpy
 from rclpy.node import Node
 
 from sensor_msgs.msg import Joy
 from geometry_msgs.msg import PoseStamped
+from nav_msgs.msg import Path
 
 
 def yaw_to_quat(yaw: float):
@@ -23,6 +25,7 @@ class JoyIntegratePoseNode(Node):
     """
     Joy axes -> (vx, vy, wz) velocity command
     integrate -> PoseStamped
+    additionally publishes recent trajectory as nav_msgs/Path
     """
 
     def __init__(self):
@@ -31,13 +34,18 @@ class JoyIntegratePoseNode(Node):
         # ---- params ----
         self.declare_parameter("joy_topic", "/joy")
         self.declare_parameter("pose_topic", "sim/pose")
+        self.declare_parameter("path_topic", "sim/path")
         self.declare_parameter("frame_id", "map")
         self.declare_parameter("publish_rate_hz", 50.0)
 
+        # Path behavior
+        self.declare_parameter("path_duration_sec", 5.0)      # keep last N seconds
+        self.declare_parameter("path_publish_rate_hz", 10.0)  # path publish rate (independent)
+
         # Axis mapping (Joy.axes index)
-        self.declare_parameter("axis_vx", 1)   # left stick vertical etc
-        self.declare_parameter("axis_vy", 0)   # left stick horizontal etc
-        self.declare_parameter("axis_wz", 2)   # right stick horizontal etc
+        self.declare_parameter("axis_vx", 1)
+        self.declare_parameter("axis_vy", 0)
+        self.declare_parameter("axis_wz", 2)
 
         # Scaling (units: m/s and rad/s)
         self.declare_parameter("scale_vx", 0.8)
@@ -47,9 +55,9 @@ class JoyIntegratePoseNode(Node):
         self.declare_parameter("deadzone", 0.05)
 
         # Integration behavior
-        self.declare_parameter("cmd_in_body_frame", True)  # True: (vx,vy) are body-frame
+        self.declare_parameter("cmd_in_body_frame", True)
         self.declare_parameter("z_height", 0.0)
-        self.declare_parameter("wrap_yaw", True)  # keep yaw in [-pi, pi]
+        self.declare_parameter("wrap_yaw", True)
 
         # Initial pose
         self.declare_parameter("x0", 0.0)
@@ -67,19 +75,29 @@ class JoyIntegratePoseNode(Node):
 
         self.last_time: Optional[rclpy.time.Time] = None
 
+        # Path buffer: (t_sec, PoseStamped)
+        self.path_buf: deque[tuple[float, PoseStamped]] = deque()
+
         # ---- I/O ----
         joy_topic = str(self.get_parameter("joy_topic").value)
         pose_topic = str(self.get_parameter("pose_topic").value)
+        path_topic = str(self.get_parameter("path_topic").value)
 
         self.sub = self.create_subscription(Joy, joy_topic, self.on_joy, 10)
-        self.pub = self.create_publisher(PoseStamped, pose_topic, 10)
+        self.pose_pub = self.create_publisher(PoseStamped, pose_topic, 10)
+        self.path_pub = self.create_publisher(Path, path_topic, 10)
 
-        rate = float(self.get_parameter("publish_rate_hz").value)
-        period = 1.0 / max(rate, 1e-3)
-        self.timer = self.create_timer(period, self.on_timer)
+        # timers
+        pose_rate = float(self.get_parameter("publish_rate_hz").value)
+        pose_period = 1.0 / max(pose_rate, 1e-3)
+        self.timer = self.create_timer(pose_period, self.on_timer)
+
+        path_rate = float(self.get_parameter("path_publish_rate_hz").value)
+        path_period = 1.0 / max(path_rate, 1e-3)
+        self.path_timer = self.create_timer(path_period, self.on_path_timer)
 
         self.get_logger().info(
-            f"Started. sub={joy_topic} pub={pose_topic} frame_id={self.get_parameter('frame_id').value}"
+            f"Started. sub={joy_topic} pose_pub={pose_topic} path_pub={path_topic} frame_id={self.get_parameter('frame_id').value}"
         )
 
     def on_joy(self, msg: Joy):
@@ -110,7 +128,8 @@ class JoyIntegratePoseNode(Node):
         now = self.get_clock().now()
         if self.last_time is None:
             self.last_time = now
-            self.publish_pose(now)
+            self.publish_pose(now)        # publish once
+            self.update_path(now)         # push to buffer
             return
 
         dt = (now - self.last_time).nanoseconds * 1e-9
@@ -119,7 +138,6 @@ class JoyIntegratePoseNode(Node):
         # integrate yaw
         self.yaw += self.wz_cmd * dt
         if bool(self.get_parameter("wrap_yaw").value):
-            # wrap to [-pi, pi]
             self.yaw = (self.yaw + math.pi) % (2.0 * math.pi) - math.pi
 
         vx = self.vx_cmd
@@ -127,7 +145,6 @@ class JoyIntegratePoseNode(Node):
         cmd_in_body = bool(self.get_parameter("cmd_in_body_frame").value)
 
         if cmd_in_body:
-            # body -> map using yaw
             cy = math.cos(self.yaw)
             sy = math.sin(self.yaw)
             vx_map = cy * vx - sy * vy
@@ -140,6 +157,7 @@ class JoyIntegratePoseNode(Node):
         self.y += vy_map * dt
 
         self.publish_pose(now)
+        self.update_path(now)
 
     def publish_pose(self, stamp: rclpy.time.Time):
         msg = PoseStamped()
@@ -156,7 +174,53 @@ class JoyIntegratePoseNode(Node):
         msg.pose.orientation.z = qz
         msg.pose.orientation.w = qw
 
-        self.pub.publish(msg)
+        self.pose_pub.publish(msg)
+
+    def update_path(self, stamp: rclpy.time.Time):
+        """
+        keep last path_duration_sec seconds of PoseStamped in buffer
+        """
+        t_sec = stamp.nanoseconds * 1e-9
+        duration = float(self.get_parameter("path_duration_sec").value)
+        if duration <= 0.0:
+            self.path_buf.clear()
+            return
+
+        # store current pose as PoseStamped
+        ps = PoseStamped()
+        ps.header.stamp = stamp.to_msg()
+        ps.header.frame_id = str(self.get_parameter("frame_id").value)
+
+        ps.pose.position.x = float(self.x)
+        ps.pose.position.y = float(self.y)
+        ps.pose.position.z = float(self.get_parameter("z_height").value)
+
+        qx, qy, qz, qw = yaw_to_quat(self.yaw)
+        ps.pose.orientation.x = qx
+        ps.pose.orientation.y = qy
+        ps.pose.orientation.z = qz
+        ps.pose.orientation.w = qw
+
+        self.path_buf.append((t_sec, ps))
+
+        # drop old
+        t_min = t_sec - duration
+        while self.path_buf and self.path_buf[0][0] < t_min:
+            self.path_buf.popleft()
+
+    def on_path_timer(self):
+        """
+        publish Path at a lower rate (e.g., 10Hz) to reduce overhead
+        """
+        if not self.path_buf:
+            return
+
+        now = self.get_clock().now()
+        msg = Path()
+        msg.header.stamp = now.to_msg()
+        msg.header.frame_id = str(self.get_parameter("frame_id").value)
+        msg.poses = [ps for (_, ps) in self.path_buf]
+        self.path_pub.publish(msg)
 
 
 def main():
