@@ -22,6 +22,17 @@ from std_msgs.msg import ColorRGBA
 
 from lidar_simulator.map_data import MAP_DATA
 from lidar_simulator.vis_utilities import create_line_marker
+from lidar_simulator.gen_pc_data import gen_ranges
+from lidar_simulator.gen_laser_scan_topic import ranges_to_laserscan
+
+import math
+
+def yaw_from_pose_stamped(msg: PoseStamped) -> float:
+    q = msg.pose.orientation
+    # yaw (Z) = atan2(2(wz + xy), 1 - 2(y^2 + z^2))
+    siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+    cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    return math.atan2(siny_cosp, cosy_cosp)
 
 class LidarSimNode(Node):
     true_pose_topic: str = 'sim/pose'
@@ -33,8 +44,10 @@ class LidarSimNode(Node):
     true_pose_msg: PoseStamped = None
     def __init__(self):
         super().__init__('lidar_sim_node')
-        self.declare_parameter('node.main_loop_rate_ms', 10)
+        self.declare_parameter('node.main_loop_rate_ms', 100)
         self.declare_parameter('node.marker_pub_loop_rate_ms', 300)
+        self.declare_parameter('lidar.num_laser_points', 100)
+        self.num_laser_points = int(self.get_parameter('lidar.num_laser_points').value)
         
         self.true_pose_sub: Subscription = self.create_subscription(
             PoseStamped,
@@ -65,7 +78,30 @@ class LidarSimNode(Node):
 
     def mainTimerCb(self) -> None:
         if self.true_pose_msg is None: return
-        self.get_logger().info("loop")
+        pose_2d: list[float] = [
+            self.true_pose_msg.pose.position.x,
+            self.true_pose_msg.pose.position.y,
+            yaw_from_pose_stamped(self.true_pose_msg)
+        ]
+        ranges = gen_ranges(
+            pose_2d,
+            self.num_laser_points,
+            MAP_DATA,
+            angle_min=0.0,
+            angle_max=2.0 * math.pi * (self.num_laser_points - 1) / self.num_laser_points,
+            range_min=0.02,
+            range_max=10.0,
+        )
+        scan_msg = ranges_to_laserscan(
+            ranges,
+            self.get_clock().now().to_msg(),
+            self.laser_frame_id,
+            angle_min=0.0,
+            angle_max=2.0 * math.pi * (self.num_laser_points - 1) / self.num_laser_points,
+            range_min=0.02,
+            range_max=10.0,
+        )
+        self.scan_pub.publish(scan_msg)
 
     def markerPubTimerCb(self) -> None:
         marker_array = MarkerArray()
@@ -80,6 +116,7 @@ class LidarSimNode(Node):
                 line_segment[0],
                 line_segment[1],
                 ColorRGBA(r=0.0, g=1.0, b=0.0, a=0.8), # Green
+                thickness=0.05
             )
             marker_array.markers.append(marker)
         self.map_marker_pub.publish(marker_array)

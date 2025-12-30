@@ -24,7 +24,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'lidar_sim_node = lidar_simulator.lidar_sim_node:main'
+            'lidar_sim_node = lidar_simulator.lidar_sim_node:main',
+            'joy_integrate_pose_node = lidar_simulator.joy_integrate_pose_node:main',
         ],
     },
 )
