@@ -11,7 +11,8 @@ MAP_DATA = np.array([
     [[0, 0.5], [0.5, 0.5]],
 ])
 
-plt.figure(figsize=(5, 5))
-for line in MAP_DATA:
-    plt.plot(line[:, 0], line[:, 1])
-plt.show()
+if __name__ == '__main__':
+    plt.figure(figsize=(5, 5))
+    for line in MAP_DATA:
+        plt.plot(line[:, 0], line[:, 1])
+    plt.show()
