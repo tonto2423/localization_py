@@ -47,7 +47,17 @@ class LidarSimNode(Node):
         self.declare_parameter('node.main_loop_rate_ms', 100)
         self.declare_parameter('node.marker_pub_loop_rate_ms', 300)
         self.declare_parameter('lidar.num_laser_points', 100)
+        self.declare_parameter('lidar.range_min', 0.02)
+        self.declare_parameter('lidar.range_max', 10.0)
+        self.declare_parameter('lidar.noise_std', 0.03)
+        self.declare_parameter('lidar.outlier_probability', 0.05)
+        self.declare_parameter('lidar.outlier_mode', 'max_range')
         self.num_laser_points = int(self.get_parameter('lidar.num_laser_points').value)
+        self.range_min = float(self.get_parameter('lidar.range_min').value)
+        self.range_max = float(self.get_parameter('lidar.range_max').value)
+        self.noise_std = float(self.get_parameter('lidar.noise_std').value)
+        self.outlier_probability = float(self.get_parameter('lidar.outlier_probability').value)
+        self.outlier_mode = str(self.get_parameter('lidar.outlier_mode').value)
         
         self.true_pose_sub: Subscription = self.create_subscription(
             PoseStamped,
@@ -89,8 +99,11 @@ class LidarSimNode(Node):
             MAP_DATA,
             angle_min=0.0,
             angle_max=2.0 * math.pi * (self.num_laser_points - 1) / self.num_laser_points,
-            range_min=0.02,
-            range_max=10.0,
+            range_min=self.range_min,
+            range_max=self.range_max,
+            noise_std=self.noise_std,
+            outlier_probability=self.outlier_probability,
+            outlier_mode=self.outlier_mode,
         )
         scan_msg = ranges_to_laserscan(
             ranges,
@@ -98,8 +111,8 @@ class LidarSimNode(Node):
             self.laser_frame_id,
             angle_min=0.0,
             angle_max=2.0 * math.pi * (self.num_laser_points - 1) / self.num_laser_points,
-            range_min=0.02,
-            range_max=10.0,
+            range_min=self.range_min,
+            range_max=self.range_max
         )
         self.scan_pub.publish(scan_msg)
 
